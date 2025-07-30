@@ -1,0 +1,53 @@
+# Method 1: Using kubectl command
+# kubectl create secret docker-registry ghes-registry-secret \
+#   --docker-server=ghes.your-company.com \
+#   --docker-username=your-username \
+#   --docker-password=your-pat-token \
+#   --docker-email=your-email@company.com \
+#   --namespace=default
+
+---
+# Method 2: Using YAML manifest
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ghes-registry-secret
+  namespace: default
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: |
+    # Base64 encoded JSON of:
+    # {
+    #   "auths": {
+    #     "ghes.your-company.com": {
+    #       "username": "your-username",
+    #       "password": "your-pat-token",
+    #       "email": "your-email@company.com",
+    #       "auth": "base64(username:password)"
+    #     }
+    #   }
+    # }
+
+---
+# Method 3: Create secret for specific namespace (e.g., karpenter nodes)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ghes-registry-secret
+  namespace: karpenter
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: # Same as above
+
+---
+# Example Pod using the secret
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pod
+spec:
+  containers:
+  - name: app
+    image: ghes.your-company.com/your-org/your-repo:latest
+  imagePullSecrets:
+  - name: ghes-registry-secret

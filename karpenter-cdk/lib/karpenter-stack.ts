@@ -396,10 +396,16 @@ kubectl get deployment -n karpenter
                         '[settings.container-registry]',
                         '# Configure Google Container Registry mirror for Docker Hub',
                         '"docker.io" = "https://mirror.gcr.io"',
+                        '# Add your GHES registry (replace with your actual GHES domain)',
+                        '# "ghes.your-company.com" = "https://ghes.your-company.com"',
+                        '',
+                        '[settings.container-registry.credentials]',
+                        '# GHES registry credentials will be managed by Kubernetes secrets',
+                        '# The kubelet will handle authentication via imagePullSecrets',
                         '',
                         '[settings.network]',
                         'https-proxy = ""',
-                        'no-proxy = ["169.254.169.254", "10.0.0.0/8"]',
+                        'no-proxy = ["169.254.169.254", "10.0.0.0/8", "ghes.your-company.com"]',
                     ].join('\n')
                 ),
                 blockDeviceMappings: [
