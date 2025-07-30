@@ -1,0 +1,36 @@
+name: Bash Git Checkout
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  checkout-with-bash:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Manual Git Checkout
+      run: |
+        # Clone the repository
+        git clone https://github.com/${{ github.repository }}.git .
+        
+        # Checkout the specific commit/ref
+        git checkout ${{ github.sha }}
+        
+        # Show current status
+        echo "Repository cloned successfully"
+        echo "Current commit: $(git rev-parse HEAD)"
+        echo "Current branch: $(git branch --show-current)"
+        
+    - name: Verify Checkout
+      run: |
+        echo "Working directory contents:"
+        ls -la
+        
+        echo "Git status:"
+        git status
+        
+        echo "Git log (last 3 commits):"
+        git log --oneline -3

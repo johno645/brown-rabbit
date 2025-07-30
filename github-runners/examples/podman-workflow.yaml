@@ -1,0 +1,96 @@
+name: Podman Build Workflow
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  podman-build:
+    runs-on: [self-hosted, kubernetes, podman, rootless-build]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up build variables
+      run: |
+        echo "IMAGE_TAG=${GITHUB_REF_NAME}-${GITHUB_SHA::8}" >> $GITHUB_ENV
+        echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+    
+    - name: Login to Container Registry
+      run: |
+        echo "${{ secrets.GITHUB_TOKEN }}" | podman login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+    
+    - name: Build image with Podman
+      run: |
+        podman build \
+          --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+          --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+          --build-arg VERSION=${{ env.IMAGE_TAG }} \
+          --build-arg BUILD_DATE=${{ env.BUILD_DATE }} \
+          --build-arg GIT_COMMIT=${{ github.sha }} \
+          --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+          --label org.opencontainers.image.revision=${{ github.sha }} \
+          --label org.opencontainers.image.created=${{ env.BUILD_DATE }} \
+          --format oci \
+          .
+    
+    - name: Test image
+      run: |
+        podman run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --version || true
+    
+    - name: Push image
+      run: |
+        podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+    
+    - name: Generate SBOM
+      run: |
+        # Install syft for SBOM generation
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /tmp
+        
+        /tmp/syft ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+          --output spdx-json \
+          --file sbom.spdx.json
+    
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v3
+      with:
+        name: sbom-${{ env.IMAGE_TAG }}
+        path: sbom.spdx.json
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        # Clean up local images to save space
+        podman rmi ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} || true
+        podman rmi ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest || true
+        podman system prune -f
+
+  security-scan:
+    needs: podman-build
+    runs-on: [self-hosted, kubernetes]
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      run: |
+        docker run --rm \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:latest image \
+          --exit-code 1 \
+          --severity HIGH,CRITICAL \
+          --format sarif \
+          --output /tmp/trivy-results.sarif \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+    
+    - name: Upload scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: /tmp/trivy-results.sarif

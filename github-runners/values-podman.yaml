@@ -1,0 +1,360 @@
+# GitHub Enterprise Configuration
+github:
+  enterpriseURL: "https://github.your-company.com"
+  organization: "your-org"
+  auth:
+    githubApp:
+      appID: ""
+      installationID: ""
+      privateKey: ""
+
+# Runner Configuration for Podman builds
+runners:
+  replicas: 3
+  labels:
+    - "self-hosted"
+    - "kubernetes"
+    - "podman"
+    - "rootless-build"
+  
+  # Resource configuration for Podman builds
+  resources:
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+  
+  # Node selector for nodes with proper configuration
+  nodeSelector:
+    node-type: "builder"
+    podman-enabled: "true"
+  
+  # Tolerations for dedicated build nodes
+  tolerations:
+    - key: "builder"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+
+# Podman-specific runner configuration
+podmanRunner:
+  enabled: true
+  
+  # Security context for rootless Podman
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  
+  # Pod security standards
+  podSecurityContext:
+    fsGroup: 1000
+    supplementalGroups: [1000]
+  
+  # Container configuration
+  containers:
+    runner:
+      image: "summerwind/actions-runner:latest"
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false  # Podman needs write access
+        capabilities:
+          drop:
+            - ALL
+          add:
+            - SETUID
+            - SETGID
+            - FOWNER
+            - DAC_OVERRIDE
+      volumeMounts:
+        - name: runner-work
+          mountPath: /runner/_work
+        - name: podman-storage
+          mountPath: /home/runner/.local/share/containers
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /run/user/1000
+    
+    # Podman sidecar container
+    podman:
+      image: "quay.io/podman/stable:latest"
+      command: ["/bin/sleep"]
+      args: ["infinity"]
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: false
+        capabilities:
+          drop:
+            - ALL
+          add:
+            - SETUID
+            - SETGID
+            - FOWNER
+            - DAC_OVERRIDE
+      resources:
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+      volumeMounts:
+        - name: runner-work
+          mountPath: /workspace
+        - name: podman-storage
+          mountPath: /home/podman/.local/share/containers
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /run/user/1000
+        - name: registry-config
+          mountPath: /home/podman/.config/containers
+          readOnly: true
+  
+  # Volume configuration
+  volumes:
+    - name: runner-work
+      emptyDir:
+        sizeLimit: "20Gi"
+    - name: podman-storage
+      emptyDir:
+        sizeLimit: "50Gi"
+    - name: tmp
+      emptyDir:
+        sizeLimit: "10Gi"
+    - name: run
+      emptyDir:
+        medium: "Memory"
+        sizeLimit: "1Gi"
+    - name: registry-config
+      configMap:
+        name: podman-registry-config
+
+# Registry configuration
+registryConfig:
+  enabled: true
+  registries:
+    - name: "ghcr.io"
+      location: "ghcr.io"
+      insecure: false
+      blocked: false
+    - name: "docker.io"
+      location: "docker.io"
+      insecure: false
+      blocked: false
+    - name: "quay.io"
+      location: "quay.io"
+      insecure: false
+      blocked: false
+    - name: "your-registry.com"
+      location: "your-registry.com"
+      insecure: false
+      blocked: false
+  
+  # Storage configuration for Podman
+  storage:
+    driver: "overlay"
+    runroot: "/run/user/1000/containers"
+    graphroot: "/home/podman/.local/share/containers/storage"
+    options:
+      overlay:
+        mount_program: "/usr/bin/fuse-overlayfs"
+        mountopt: "nodev,fsync=0"
+
+# Network policies for security
+networkPolicies:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: github-runners
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443  # HTTPS
+        - protocol: TCP
+          port: 80   # HTTP
+        - protocol: TCP
+          port: 22   # SSH
+
+# RBAC configuration
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: [""]
+      resources: ["configmaps", "secrets"]
+      verbs: ["get", "list", "create", "update", "patch", "delete"]
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+# Service account configuration
+serviceAccount:
+  create: true
+  annotations:
+    # Add any cloud provider annotations here
+  name: "podman-runner"
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Monitoring and observability
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+  
+  # Prometheus metrics
+  metrics:
+    enabled: true
+    port: 8080
+    path: /metrics
+
+# Storage classes for different workloads
+storageClasses:
+  # Fast storage for build cache
+  buildCache:
+    name: "fast-ssd"
+    provisioner: "kubernetes.io/aws-ebs"
+    parameters:
+      type: "gp3"
+      iops: "3000"
+      throughput: "125"
+  
+  # Standard storage for workspace
+  workspace:
+    name: "standard"
+    provisioner: "kubernetes.io/aws-ebs"
+    parameters:
+      type: "gp3"
+
+# Init containers for setup
+initContainers:
+  - name: setup-podman
+    image: "quay.io/podman/stable:latest"
+    command: ["/bin/sh"]
+    args:
+      - -c
+      - |
+        # Setup user namespaces
+        echo "runner:100000:65536" > /etc/subuid
+        echo "runner:100000:65536" > /etc/subgid
+        
+        # Create necessary directories
+        mkdir -p /home/runner/.config/containers
+        mkdir -p /home/runner/.local/share/containers
+        
+        # Set permissions
+        chown -R 1000:1000 /home/runner/.config
+        chown -R 1000:1000 /home/runner/.local
+    securityContext:
+      runAsUser: 0
+    volumeMounts:
+      - name: runner-work
+        mountPath: /home/runner
+
+# Environment variables
+env:
+  # Podman configuration
+  CONTAINERS_CONF: "/home/runner/.config/containers/containers.conf"
+  CONTAINERS_STORAGE_CONF: "/home/runner/.config/containers/storage.conf"
+  CONTAINERS_REGISTRIES_CONF: "/home/runner/.config/containers/registries.conf"
+  
+  # User namespace configuration
+  BUILDAH_ISOLATION: "chroot"
+  STORAGE_DRIVER: "overlay"
+  
+  # GitHub Actions specific
+  ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER: "false"
+  RUNNER_ALLOW_RUNASROOT: "false"
+
+# ConfigMaps for Podman configuration
+configMaps:
+  podman-registry-config:
+    data:
+      registries.conf: |
+        [registries.search]
+        registries = ['docker.io', 'quay.io', 'ghcr.io']
+        
+        [registries.insecure]
+        registries = []
+        
+        [registries.block]
+        registries = []
+      
+      containers.conf: |
+        [containers]
+        default_ulimits = [
+          "nofile=65536:65536",
+        ]
+        
+        [engine]
+        cgroup_manager = "systemd"
+        events_logger = "journald"
+        runtime = "crun"
+        
+        [network]
+        network_backend = "netavark"
+      
+      storage.conf: |
+        [storage]
+        driver = "overlay"
+        runroot = "/run/user/1000/containers"
+        graphroot = "/home/runner/.local/share/containers/storage"
+        
+        [storage.options]
+        additionalimagestores = []
+        
+        [storage.options.overlay]
+        mount_program = "/usr/bin/fuse-overlayfs"
+        mountopt = "nodev,fsync=0"
+
+# Secrets for registry authentication
+secrets:
+  registry-auth:
+    type: "kubernetes.io/dockerconfigjson"
+    data:
+      .dockerconfigjson: |
+        {
+          "auths": {
+            "ghcr.io": {
+              "auth": "base64-encoded-credentials"
+            },
+            "your-registry.com": {
+              "auth": "base64-encoded-credentials"
+            }
+          }
+        }

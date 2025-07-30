@@ -1,0 +1,120 @@
+name: Kaniko with ECR Public Gallery
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  ECR_PUBLIC_REGISTRY: public.ecr.aws
+  ECR_PRIVATE_REGISTRY: 123456789012.dkr.ecr.us-west-2.amazonaws.com
+  IMAGE_NAME: my-app
+
+jobs:
+  kaniko-ecr-public:
+    runs-on: [self-hosted, kubernetes]
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: GitHubActions-Kaniko
+        aws-region: us-east-1
+    
+    - name: Create multi-registry Docker config
+      run: |
+        mkdir -p /tmp/kaniko-config
+        
+        # Get ECR Public token
+        ECR_PUBLIC_TOKEN=$(aws ecr-public get-login-password --region us-east-1)
+        
+        # Get Private ECR token
+        ECR_PRIVATE_TOKEN=$(aws ecr get-login-password --region us-west-2)
+        
+        # Create Docker config with both registries
+        cat > /tmp/kaniko-config/config.json << EOF
+        {
+          "auths": {
+            "${{ env.ECR_PUBLIC_REGISTRY }}": {
+              "username": "AWS",
+              "password": "${ECR_PUBLIC_TOKEN}"
+            },
+            "${{ env.ECR_PRIVATE_REGISTRY }}": {
+              "username": "AWS",
+              "password": "${ECR_PRIVATE_TOKEN}"
+            }
+          }
+        }
+        EOF
+        
+        chmod 600 /tmp/kaniko-config/config.json
+    
+    - name: Create Dockerfile with ECR Public base
+      run: |
+        cat > Dockerfile << 'EOF'
+        # Use ECR Public Gallery image
+        FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+        
+        # Install dependencies
+        RUN yum update -y && \
+            yum install -y \
+                nodejs \
+                npm \
+                git && \
+            yum clean all && \
+            rm -rf /var/cache/yum
+        
+        # Create app directory
+        WORKDIR /app
+        
+        # Copy package files
+        COPY package*.json ./
+        
+        # Install dependencies
+        RUN npm ci --only=production && \
+            npm cache clean --force
+        
+        # Copy application code
+        COPY . .
+        
+        # Create non-root user
+        RUN groupadd -r appuser && \
+            useradd -r -g appuser appuser && \
+            chown -R appuser:appuser /app
+        
+        USER appuser
+        
+        EXPOSE 3000
+        
+        CMD ["npm", "start"]
+        EOF
+    
+    - name: Build with Kaniko
+      run: |
+        docker run --rm \
+          -v ${{ github.workspace }}:/workspace \
+          -v /tmp/kaniko-config:/kaniko/.docker:ro \
+          gcr.io/kaniko-project/executor:latest \
+          --dockerfile=/workspace/Dockerfile \
+          --context=dir:///workspace \
+          --destination=${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          --destination=${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+          --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+          --build-arg GIT_COMMIT=${{ github.sha }} \
+          --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+          --label org.opencontainers.image.revision=${{ github.sha }} \
+          --cache=true \
+          --cache-repo=${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}/cache \
+          --cleanup \
+          --verbosity=info
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf /tmp/kaniko-config

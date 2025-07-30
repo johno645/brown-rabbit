@@ -1,0 +1,86 @@
+name: ECR Public Gallery Authentication
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  ECR_PUBLIC_REGISTRY: public.ecr.aws
+  ECR_PRIVATE_REGISTRY: 123456789012.dkr.ecr.us-west-2.amazonaws.com
+  IMAGE_NAME: my-app
+
+jobs:
+  build-with-ecr-public:
+    runs-on: [self-hosted, kubernetes, podman]
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: GitHubActions-ECRPublic
+        aws-region: us-east-1  # ECR Public is only in us-east-1
+    
+    # ECR Public Gallery authentication
+    - name: Login to ECR Public Gallery
+      run: |
+        # ECR Public uses different authentication
+        aws ecr-public get-login-password --region us-east-1 | \
+          podman login --username AWS --password-stdin ${{ env.ECR_PUBLIC_REGISTRY }}
+    
+    # Private ECR authentication (if needed)
+    - name: Login to Private ECR
+      run: |
+        aws ecr get-login-password --region us-west-2 | \
+          podman login --username AWS --password-stdin ${{ env.ECR_PRIVATE_REGISTRY }}
+    
+    - name: Pull base image from ECR Public
+      run: |
+        # Pull from ECR Public Gallery
+        podman pull ${{ env.ECR_PUBLIC_REGISTRY }}/amazonlinux/amazonlinux:latest
+        
+        # Tag for local use
+        podman tag ${{ env.ECR_PUBLIC_REGISTRY }}/amazonlinux/amazonlinux:latest amazonlinux:latest
+    
+    - name: Build application image
+      run: |
+        # Create Dockerfile using ECR Public base
+        cat > Dockerfile << 'EOF'
+        FROM public.ecr.aws/amazonlinux/amazonlinux:latest
+        
+        RUN yum update -y && \
+            yum install -y nodejs npm && \
+            yum clean all
+        
+        WORKDIR /app
+        COPY package*.json ./
+        RUN npm ci --only=production
+        
+        COPY . .
+        EXPOSE 3000
+        CMD ["npm", "start"]
+        EOF
+        
+        # Build with Podman
+        podman build \
+          --tag ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          --tag ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+          .
+    
+    - name: Push to private ECR
+      run: |
+        podman push ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        podman push ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        podman rmi ${{ env.ECR_PUBLIC_REGISTRY }}/amazonlinux/amazonlinux:latest || true
+        podman rmi amazonlinux:latest || true
+        podman system prune -f

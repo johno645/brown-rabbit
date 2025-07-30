@@ -1,0 +1,159 @@
+# Alternative approach: DaemonSet to configure existing EKS nodes
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: podman-node-setup
+  namespace: kube-system
+  labels:
+    app: podman-node-setup
+spec:
+  selector:
+    matchLabels:
+      app: podman-node-setup
+  template:
+    metadata:
+      labels:
+        app: podman-node-setup
+    spec:
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      tolerations:
+      - operator: Exists
+      nodeSelector:
+        node-type: builder
+      containers:
+      - name: node-setup
+        image: amazonlinux:2
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          set -e
+          
+          echo "Setting up node for rootless container builds..."
+          
+          # Enable user namespaces
+          echo 'user.max_user_namespaces = 65536' >> /host/etc/sysctl.conf
+          echo 'user.max_pid_namespaces = 65536' >> /host/etc/sysctl.conf
+          echo 'user.max_net_namespaces = 65536' >> /host/etc/sysctl.conf
+          
+          # Apply sysctl settings
+          nsenter -t 1 -m -u -n -i sysctl -p
+          
+          # Install fuse-overlayfs if not present
+          if ! nsenter -t 1 -m -u -n -i which fuse-overlayfs; then
+            echo "Installing fuse-overlayfs..."
+            nsenter -t 1 -m -u -n -i yum install -y fuse-overlayfs
+          fi
+          
+          # Install crun if not present
+          if ! nsenter -t 1 -m -u -n -i test -f /usr/local/bin/crun; then
+            echo "Installing crun..."
+            CRUN_VERSION="1.8.7"
+            curl -L "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64" \
+                -o /host/usr/local/bin/crun
+            chmod +x /host/usr/local/bin/crun
+          fi
+          
+          # Set up subuid/subgid ranges
+          if ! grep -q "ec2-user:100000:65536" /host/etc/subuid; then
+            echo 'ec2-user:100000:65536' >> /host/etc/subuid
+          fi
+          if ! grep -q "ec2-user:100000:65536" /host/etc/subgid; then
+            echo 'ec2-user:100000:65536' >> /host/etc/subgid
+          fi
+          
+          # Configure containerd for crun
+          mkdir -p /host/etc/containerd/
+          cat > /host/etc/containerd/config.toml << 'EOF'
+          version = 2
+          
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                      BinaryName = "/usr/local/bin/crun"
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.crun]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.crun.options]
+                      BinaryName = "/usr/local/bin/crun"
+          EOF
+          
+          # Restart containerd
+          nsenter -t 1 -m -u -n -i systemctl restart containerd
+          
+          # Label the node
+          kubectl label node $NODE_NAME podman-enabled=true --overwrite
+          kubectl label node $NODE_NAME node-type=builder --overwrite
+          
+          echo "Node setup completed successfully"
+          
+          # Keep container running
+          sleep infinity
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+        - name: host-sys
+          mountPath: /sys
+        - name: host-proc
+          mountPath: /proc
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+      - name: host-sys
+        hostPath:
+          path: /sys
+      - name: host-proc
+        hostPath:
+          path: /proc
+      serviceAccountName: podman-node-setup
+      
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podman-node-setup
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podman-node-setup
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podman-node-setup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podman-node-setup
+subjects:
+- kind: ServiceAccount
+  name: podman-node-setup
+  namespace: kube-system

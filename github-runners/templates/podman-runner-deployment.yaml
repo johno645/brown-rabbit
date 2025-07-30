@@ -1,0 +1,284 @@
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: podman-runners
+  namespace: {{ .Values.namespace | default "github-runners" }}
+spec:
+  replicas: {{ .Values.runners.replicas | default 3 }}
+  template:
+    spec:
+      organization: {{ .Values.github.organization }}
+      labels:
+        - self-hosted
+        - kubernetes
+        - podman
+        - rootless-build
+      
+      # Security context for rootless operation
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Pod security context
+      podSecurityContext:
+        fsGroup: 1000
+        supplementalGroups: [1000]
+      
+      containers:
+      # Main runner container
+      - name: runner
+        image: summerwind/actions-runner:latest
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+              - ALL
+            add:
+              - SETUID
+              - SETGID
+              - FOWNER
+              - DAC_OVERRIDE
+        resources:
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+        env:
+        - name: RUNNER_ALLOW_RUNASROOT
+          value: "false"
+        - name: ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER
+          value: "false"
+        - name: CONTAINERS_CONF
+          value: "/home/runner/.config/containers/containers.conf"
+        - name: CONTAINERS_STORAGE_CONF
+          value: "/home/runner/.config/containers/storage.conf"
+        - name: CONTAINERS_REGISTRIES_CONF
+          value: "/home/runner/.config/containers/registries.conf"
+        volumeMounts:
+        - name: runner-work
+          mountPath: /runner/_work
+        - name: podman-storage
+          mountPath: /home/runner/.local/share/containers
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /run/user/1000
+        - name: registry-config
+          mountPath: /home/runner/.config/containers
+          readOnly: true
+        - name: registry-auth
+          mountPath: /home/runner/.docker
+          readOnly: true
+      
+      # Podman sidecar container
+      - name: podman
+        image: quay.io/podman/stable:latest
+        command: ["/bin/sleep"]
+        args: ["infinity"]
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+              - ALL
+            add:
+              - SETUID
+              - SETGID
+              - FOWNER
+              - DAC_OVERRIDE
+        resources:
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+        env:
+        - name: BUILDAH_ISOLATION
+          value: "chroot"
+        - name: STORAGE_DRIVER
+          value: "overlay"
+        - name: CONTAINERS_CONF
+          value: "/home/podman/.config/containers/containers.conf"
+        volumeMounts:
+        - name: runner-work
+          mountPath: /workspace
+        - name: podman-storage
+          mountPath: /home/podman/.local/share/containers
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /run/user/1000
+        - name: registry-config
+          mountPath: /home/podman/.config/containers
+          readOnly: true
+      
+      # Init container for setup
+      initContainers:
+      - name: setup-podman
+        image: quay.io/podman/stable:latest
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          # Setup user namespaces
+          echo "runner:100000:65536" > /etc/subuid
+          echo "runner:100000:65536" > /etc/subgid
+          
+          # Create necessary directories
+          mkdir -p /home/runner/.config/containers
+          mkdir -p /home/runner/.local/share/containers
+          mkdir -p /run/user/1000
+          
+          # Set permissions
+          chown -R 1000:1000 /home/runner/.config
+          chown -R 1000:1000 /home/runner/.local
+          chown -R 1000:1000 /run/user/1000
+          
+          # Setup storage directories
+          mkdir -p /home/runner/.local/share/containers/storage
+          chown -R 1000:1000 /home/runner/.local/share/containers/storage
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - name: runner-work
+          mountPath: /home/runner
+        - name: podman-storage
+          mountPath: /home/runner/.local/share/containers
+        - name: run
+          mountPath: /run/user/1000
+      
+      volumes:
+      - name: runner-work
+        emptyDir:
+          sizeLimit: "20Gi"
+      - name: podman-storage
+        emptyDir:
+          sizeLimit: "50Gi"
+      - name: tmp
+        emptyDir:
+          sizeLimit: "10Gi"
+      - name: run
+        emptyDir:
+          medium: "Memory"
+          sizeLimit: "1Gi"
+      - name: registry-config
+        configMap:
+          name: podman-registry-config
+      - name: registry-auth
+        secret:
+          secretName: registry-auth
+          items:
+          - key: .dockerconfigjson
+            path: config.json
+      
+      # Node placement
+      nodeSelector:
+        node-type: builder
+        podman-enabled: "true"
+      
+      tolerations:
+      - key: "builder"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+---
+# ConfigMap for Podman configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: podman-registry-config
+  namespace: {{ .Values.namespace | default "github-runners" }}
+data:
+  registries.conf: |
+    [registries.search]
+    registries = ['docker.io', 'quay.io', 'ghcr.io']
+    
+    [registries.insecure]
+    registries = []
+    
+    [registries.block]
+    registries = []
+  
+  containers.conf: |
+    [containers]
+    default_ulimits = [
+      "nofile=65536:65536",
+    ]
+    
+    [engine]
+    cgroup_manager = "systemd"
+    events_logger = "journald"
+    runtime = "crun"
+    
+    [network]
+    network_backend = "netavark"
+  
+  storage.conf: |
+    [storage]
+    driver = "overlay"
+    runroot = "/run/user/1000/containers"
+    graphroot = "/home/runner/.local/share/containers/storage"
+    
+    [storage.options]
+    additionalimagestores = []
+    
+    [storage.options.overlay]
+    mount_program = "/usr/bin/fuse-overlayfs"
+    mountopt = "nodev,fsync=0"
+
+---
+# RBAC for Podman runners
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: podman-runner
+  namespace: {{ .Values.namespace | default "github-runners" }}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: podman-runner
+  namespace: {{ .Values.namespace | default "github-runners" }}
+subjects:
+- kind: ServiceAccount
+  name: podman-runner
+  namespace: {{ .Values.namespace | default "github-runners" }}
+roleRef:
+  kind: Role
+  name: podman-runner
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podman-runner
+  namespace: {{ .Values.namespace | default "github-runners" }}
+automountServiceAccountToken: true
