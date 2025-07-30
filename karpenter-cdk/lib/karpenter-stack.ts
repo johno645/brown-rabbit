@@ -6,6 +6,7 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import { Construct } from 'constructs';
+import { KarpenterControllerPolicy } from './karpenter-controller-policy';
 
 export interface KarpenterStackProps extends cdk.StackProps {
     cluster: eks.Cluster;
@@ -39,6 +40,12 @@ export class KarpenterStack extends cdk.Stack {
             roles: [this.karpenterNodeRole.roleName],
         });
 
+        // Create SQS queue for spot interruption handling
+        const karpenterQueue = new sqs.Queue(this, 'KarpenterQueue', {
+            queueName: `Karpenter-${cluster.clusterName}`,
+            messageRetentionPeriod: cdk.Duration.seconds(300),
+        });
+
         // Create Karpenter controller IAM role
         const karpenterControllerRole = new iam.Role(this, 'KarpenterControllerRole', {
             roleName: `KarpenterControllerRole-${cluster.clusterName}`,
@@ -54,229 +61,15 @@ export class KarpenterStack extends cdk.Stack {
             ),
         });
 
-        // Karpenter controller policy
-        const karpenterControllerPolicy = new iam.Policy(this, 'KarpenterControllerPolicy', {
-            policyName: `KarpenterControllerPolicy-${cluster.clusterName}`,
-            statements: [
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedEC2InstanceAccessActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: [
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}::image/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}::snapshot/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:security-group/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:subnet/*`,
-                    ],
-                    actions: [
-                        'ec2:RunInstances',
-                        'ec2:CreateFleet',
-                    ],
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedEC2LaunchTemplateAccessActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: [`arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:launch-template/*`],
-                    actions: [
-                        'ec2:RunInstances',
-                        'ec2:CreateFleet',
-                    ],
-                    conditions: {
-                        StringEquals: {
-                            'aws:ResourceTag/kubernetes.io/cluster/${ClusterName}': 'owned',
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedEC2InstanceActionsWithTags',
-                    effect: iam.Effect.ALLOW,
-                    resources: [`arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:instance/*`],
-                    actions: [
-                        'ec2:RunInstances',
-                        'ec2:CreateFleet',
-                        'ec2:CreateTags',
-                    ],
-                    conditions: {
-                        StringEquals: {
-                            'aws:RequestedRegion': cdk.Aws.REGION,
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedResourceCreationTagging',
-                    effect: iam.Effect.ALLOW,
-                    resources: [
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:fleet/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:instance/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:volume/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:network-interface/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:launch-template/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:spot-instances-request/*`,
-                    ],
-                    actions: ['ec2:CreateTags'],
-                    conditions: {
-                        StringEquals: {
-                            'aws:RequestedRegion': cdk.Aws.REGION,
-                            'ec2:CreateAction': [
-                                'RunInstances',
-                                'CreateFleet',
-                                'CreateLaunchTemplate',
-                            ],
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedResourceTagging',
-                    effect: iam.Effect.ALLOW,
-                    resources: [`arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:instance/*`],
-                    actions: ['ec2:CreateTags'],
-                    conditions: {
-                        StringEquals: {
-                            'aws:ResourceTag/kubernetes.io/cluster/${ClusterName}': 'owned',
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedDeletion',
-                    effect: iam.Effect.ALLOW,
-                    resources: [
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:instance/*`,
-                        `arn:${cdk.Aws.PARTITION}:ec2:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:launch-template/*`,
-                    ],
-                    actions: [
-                        'ec2:TerminateInstances',
-                        'ec2:DeleteLaunchTemplate',
-                    ],
-                    conditions: {
-                        StringEquals: {
-                            'aws:ResourceTag/kubernetes.io/cluster/${ClusterName}': 'owned',
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowRegionalReadActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: ['*'],
-                    actions: [
-                        'ec2:DescribeAvailabilityZones',
-                        'ec2:DescribeImages',
-                        'ec2:DescribeInstances',
-                        'ec2:DescribeInstanceTypeOfferings',
-                        'ec2:DescribeInstanceTypes',
-                        'ec2:DescribeLaunchTemplates',
-                        'ec2:DescribeSecurityGroups',
-                        'ec2:DescribeSpotPriceHistory',
-                        'ec2:DescribeSubnets',
-                    ],
-                    conditions: {
-                        StringEquals: {
-                            'aws:RequestedRegion': cdk.Aws.REGION,
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowSSMReadActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: [`arn:${cdk.Aws.PARTITION}:ssm:${cdk.Aws.REGION}::parameter/aws/service/*`],
-                    actions: ['ssm:GetParameter'],
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowPricingReadActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: ['*'],
-                    actions: ['pricing:GetProducts'],
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowInterruptionQueueActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: [`arn:${cdk.Aws.PARTITION}:sqs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:Karpenter-${cluster.clusterName}`],
-                    actions: [
-                        'sqs:DeleteMessage',
-                        'sqs:GetQueueUrl',
-                        'sqs:GetQueueAttributes',
-                        'sqs:ReceiveMessage',
-                    ],
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowPassingInstanceRole',
-                    effect: iam.Effect.ALLOW,
-                    resources: [this.karpenterNodeRole.roleArn],
-                    actions: ['iam:PassRole'],
-                    conditions: {
-                        StringEquals: {
-                            'iam:PassedToService': 'ec2.amazonaws.com',
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedInstanceProfileCreationActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: ['*'],
-                    actions: [
-                        'iam:CreateInstanceProfile',
-                        'iam:TagInstanceProfile',
-                        'iam:AddRoleToInstanceProfile',
-                        'iam:RemoveRoleFromInstanceProfile',
-                        'iam:DeleteInstanceProfile',
-                    ],
-                    conditions: {
-                        StringEquals: {
-                            'aws:RequestedRegion': cdk.Aws.REGION,
-                        },
-                        StringLike: {
-                            'aws:RequestTag/kubernetes.io/cluster/*': 'owned',
-                            'aws:RequestTag/topology.kubernetes.io/zone': '*',
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedInstanceProfileTagActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: ['*'],
-                    actions: ['iam:TagInstanceProfile'],
-                    conditions: {
-                        StringEquals: {
-                            'aws:ResourceTag/kubernetes.io/cluster/${ClusterName}': 'owned',
-                            'aws:RequestedRegion': cdk.Aws.REGION,
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowScopedInstanceProfileActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: ['*'],
-                    actions: [
-                        'iam:AddRoleToInstanceProfile',
-                        'iam:RemoveRoleFromInstanceProfile',
-                        'iam:DeleteInstanceProfile',
-                    ],
-                    conditions: {
-                        StringEquals: {
-                            'aws:ResourceTag/kubernetes.io/cluster/${ClusterName}': 'owned',
-                        },
-                    },
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowInstanceProfileReadActions',
-                    effect: iam.Effect.ALLOW,
-                    resources: ['*'],
-                    actions: ['iam:GetInstanceProfile'],
-                }),
-                new iam.PolicyStatement({
-                    sid: 'AllowAPIServerEndpointDiscovery',
-                    effect: iam.Effect.ALLOW,
-                    resources: [`arn:${cdk.Aws.PARTITION}:eks:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:cluster/${cluster.clusterName}`],
-                    actions: ['eks:DescribeCluster'],
-                }),
-            ],
+        // Create Karpenter controller policy using the new construct
+        const karpenterControllerPolicyConstruct = new KarpenterControllerPolicy(this, 'KarpenterControllerPolicy', {
+            clusterName: cluster.clusterName,
+            karpenterInterruptionQueueArn: karpenterQueue.queueArn,
+            karpenterNodeRoleArn: this.karpenterNodeRole.roleArn,
         });
 
-        karpenterControllerRole.attachInlinePolicy(karpenterControllerPolicy);
-
-        // Create SQS queue for spot interruption handling
-        const karpenterQueue = new sqs.Queue(this, 'KarpenterQueue', {
-            queueName: `Karpenter-${cluster.clusterName}`,
-            messageRetentionPeriod: cdk.Duration.seconds(300),
-        });
+        // Attach the managed policy to the controller role
+        karpenterControllerRole.addManagedPolicy(karpenterControllerPolicyConstruct.managedPolicy);
 
         // Create EventBridge rules for spot interruption
         const spotInterruptionRule = new events.Rule(this, 'SpotInterruptionRule', {
