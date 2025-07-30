@@ -293,7 +293,7 @@ kubectl get deployment -n karpenter
 
         // Create default NodePool
         const defaultNodePool = cluster.addManifest('DefaultNodePool', {
-            apiVersion: 'karpenter.sh/v1beta1',
+            apiVersion: 'karpenter.sh/v1',
             kind: 'NodePool',
             metadata: {
                 name: 'default',
@@ -333,7 +333,7 @@ kubectl get deployment -n karpenter
                             },
                         ],
                         nodeClassRef: {
-                            apiVersion: 'karpenter.k8s.aws/v1beta1',
+                            apiVersion: 'karpenter.k8s.aws/v1',
                             kind: 'EC2NodeClass',
                             name: 'default',
                         },
@@ -360,14 +360,14 @@ kubectl get deployment -n karpenter
 
         // Create default EC2NodeClass
         const defaultNodeClass = cluster.addManifest('DefaultNodeClass', {
-            apiVersion: 'karpenter.k8s.aws/v1beta1',
+            apiVersion: 'karpenter.k8s.aws/v1',
             kind: 'EC2NodeClass',
             metadata: {
                 name: 'default',
                 namespace: 'karpenter',
             },
             spec: {
-                amiFamily: 'AL2',
+                amiFamily: 'Bottlerocket',
                 subnetSelectorTerms: [
                     {
                         tags: {
@@ -385,15 +385,37 @@ kubectl get deployment -n karpenter
                 instanceStorePolicy: 'RAID0',
                 userData: cdk.Fn.base64(
                     [
-                        '#!/bin/bash',
-                        '/etc/eks/bootstrap.sh ' + cluster.clusterName,
-                        'echo "net.ipv4.conf.all.route_localnet = 1" >> /etc/sysctl.conf',
-                        'sysctl -p /etc/sysctl.conf',
+                        '[settings.kubernetes]',
+                        `cluster-name = "${cluster.clusterName}"`,
+                        `api-server = "${cluster.clusterEndpoint}"`,
+                        `cluster-certificate = "${cluster.clusterCertificateAuthorityData}"`,
+                        '',
+                        '[settings.container-runtime]',
+                        'max-container-log-line-size = 16384',
+                        '',
+                        '[settings.container-registry]',
+                        '# Configure Google Container Registry mirror for Docker Hub',
+                        '"docker.io" = "https://mirror.gcr.io"',
+                        '',
+                        '[settings.network]',
+                        'https-proxy = ""',
+                        'no-proxy = ["169.254.169.254", "10.0.0.0/8"]',
                     ].join('\n')
                 ),
                 blockDeviceMappings: [
                     {
                         deviceName: '/dev/xvda',
+                        ebs: {
+                            volumeSize: '20Gi',
+                            volumeType: 'gp3',
+                            iops: 3000,
+                            throughput: 125,
+                            deleteOnTermination: true,
+                            encrypted: true,
+                        },
+                    },
+                    {
+                        deviceName: '/dev/xvdb',
                         ebs: {
                             volumeSize: '100Gi',
                             volumeType: 'gp3',

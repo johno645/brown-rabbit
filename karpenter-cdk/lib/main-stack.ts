@@ -148,7 +148,7 @@ export class MainStack extends cdk.Stack {
 
     // Create NodePool for GitHub Actions runners
     const githubRunnersNodePool = cluster.addManifest('GitHubRunnersNodePool', {
-      apiVersion: 'karpenter.sh/v1beta1',
+      apiVersion: 'karpenter.sh/v1',
       kind: 'NodePool',
       metadata: {
         name: 'github-runners',
@@ -189,7 +189,7 @@ export class MainStack extends cdk.Stack {
               },
             ],
             nodeClassRef: {
-              apiVersion: 'karpenter.k8s.aws/v1beta1',
+              apiVersion: 'karpenter.k8s.aws/v1',
               kind: 'EC2NodeClass',
               name: 'github-runners',
             },
@@ -216,14 +216,14 @@ export class MainStack extends cdk.Stack {
 
     // Create EC2NodeClass for GitHub Actions runners
     const githubRunnersNodeClass = cluster.addManifest('GitHubRunnersNodeClass', {
-      apiVersion: 'karpenter.k8s.aws/v1beta1',
+      apiVersion: 'karpenter.k8s.aws/v1',
       kind: 'EC2NodeClass',
       metadata: {
         name: 'github-runners',
         namespace: 'karpenter',
       },
       spec: {
-        amiFamily: 'AL2',
+        amiFamily: 'Bottlerocket',
         subnetSelectorTerms: [
           {
             tags: {
@@ -241,33 +241,44 @@ export class MainStack extends cdk.Stack {
         instanceStorePolicy: 'RAID0',
         userData: cdk.Fn.base64(
           [
-            '#!/bin/bash',
-            '/etc/eks/bootstrap.sh ' + cluster.clusterName,
+            '[settings.kubernetes]',
+            `cluster-name = "${cluster.clusterName}"`,
+            `api-server = "${cluster.clusterEndpoint}"`,
+            `cluster-certificate = "${cluster.clusterCertificateAuthorityData}"`,
             '',
-            '# Configure for container builds',
-            'echo "user.max_user_namespaces = 65536" >> /etc/sysctl.conf',
-            'echo "user.max_pid_namespaces = 65536" >> /etc/sysctl.conf',
-            'sysctl -p',
+            '[settings.container-runtime]',
+            'max-container-log-line-size = 16384',
             '',
-            '# Install build tools',
-            'yum update -y',
-            'yum install -y git docker fuse-overlayfs',
+            '[settings.container-registry]',
+            '# Configure Google Container Registry mirror for Docker Hub',
+            '"docker.io" = "https://mirror.gcr.io"',
             '',
-            '# Configure Docker daemon',
-            'systemctl enable docker',
-            'systemctl start docker',
-            'usermod -aG docker ec2-user',
+            '[settings.network]',
+            'https-proxy = ""',
+            'no-proxy = ["169.254.169.254", "10.0.0.0/8"]',
             '',
-            '# Set up subuid/subgid for rootless containers',
-            'echo "ec2-user:100000:65536" >> /etc/subuid',
-            'echo "ec2-user:100000:65536" >> /etc/subgid',
+            '[settings.host-containers.admin]',
+            'enabled = true',
+            'superpowered = true',
+            '',
+            '[settings.host-containers.control]',
+            'enabled = true',
+            'superpowered = false',
+            '',
+            '# Additional settings for CI/CD workloads',
+            '[settings.kernel]',
+            'lockdown = "none"',
+            '',
+            '[settings.kernel.sysctl]',
+            '"user.max_user_namespaces" = "65536"',
+            '"user.max_pid_namespaces" = "65536"',
           ].join('\n')
         ),
         blockDeviceMappings: [
           {
             deviceName: '/dev/xvda',
             ebs: {
-              volumeSize: '100Gi',
+              volumeSize: '20Gi',
               volumeType: 'gp3',
               iops: 3000,
               throughput: 125,
