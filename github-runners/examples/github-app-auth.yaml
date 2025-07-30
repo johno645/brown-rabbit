@@ -1,0 +1,50 @@
+name: Build with GitHub App Authentication
+
+on:
+  push:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghes.your-company.com
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: [self-hosted, linux, karpenter]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Generate GitHub App Token
+      id: app-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.GHES_APP_ID }}
+        private-key: ${{ secrets.GHES_APP_PRIVATE_KEY }}
+        # Optional: specify repositories (defaults to the repository where the workflow runs)
+        repositories: |
+          ${{ github.repository }}
+        # Permissions needed for container registry
+        permissions: |
+          packages: write
+          contents: read
+
+    - name: Login to GHES Container Registry
+      run: |
+        echo "${{ steps.app-token.outputs.token }}" | podman login ${{ env.REGISTRY }} -u x-access-token --password-stdin
+
+    - name: Build and push
+      run: |
+        podman build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        podman push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+    - name: Create Kubernetes secret with App token
+      run: |
+        kubectl create secret docker-registry ghes-app-secret \
+          --docker-server=${{ env.REGISTRY }} \
+          --docker-username=x-access-token \
+          --docker-password=${{ steps.app-token.outputs.token }} \
+          --docker-email=noreply@github.com \
+          --namespace=default \
+          --dry-run=client -o yaml | kubectl apply -f -

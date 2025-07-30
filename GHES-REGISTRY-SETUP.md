@@ -7,9 +7,13 @@ This guide explains how to configure your EKS cluster to pull container images f
 - GHES instance with container registry enabled
 - EKS cluster with Karpenter deployed
 - kubectl configured for your cluster
-- Personal Access Token (PAT) with `read:packages` permission
+- Authentication method (choose one):
+  - Personal Access Token (PAT) with `read:packages` permission
+  - GitHub App with repository-specific access (recommended for better security)
 
-## Step 1: Create Personal Access Token
+## Step 1: Choose Authentication Method
+
+### Option A: Personal Access Token (PAT)
 
 1. Navigate to your GHES instance
 2. Go to **Settings** → **Developer settings** → **Personal access tokens**
@@ -17,6 +21,29 @@ This guide explains how to configure your EKS cluster to pull container images f
    - `read:packages` (required for pulling images)
    - `write:packages` (if you need to push images)
    - `delete:packages` (if you need to delete images)
+
+### Option B: GitHub App (Recommended for Repository-Specific Access)
+
+**Note**: GHES doesn't support repository-specific PATs like GitLab, but GitHub Apps provide similar granular access control.
+
+1. **Create GitHub App**:
+   - Go to **Settings** → **Developer settings** → **GitHub Apps**
+   - Click **New GitHub App**
+   - Set permissions: `Contents: Read`, `Packages: Write`, `Metadata: Read`
+
+2. **Install on specific repositories**:
+   - After creation, install the app only on repositories that need registry access
+   - This provides repository-scoped access similar to GitLab project tokens
+
+3. **Use in workflows**:
+   - See `github-runners/examples/github-app-auth.yaml` for implementation
+   - See `github-runners/setup/github-app-setup.md` for detailed setup guide
+
+**Benefits of GitHub Apps over PATs**:
+- Repository-specific access (not user-wide)
+- Automatic token rotation (1-hour expiry)
+- Better audit trail and attribution
+- Can be revoked per repository
 
 ## Step 2: Create Kubernetes Registry Secret
 
