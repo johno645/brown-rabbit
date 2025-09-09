@@ -1,0 +1,342 @@
+[settings.kubernetes]
+cluster-name = "${cluster_name}"
+api-server = "${cluster_endpoint}"
+cluster-certificate = "${cluster_ca}"
+
+[settings.kubernetes.node-labels]
+"node.kubernetes.io/instance-type" = "{{EC2_INSTANCE_TYPE}}"
+"topology.kubernetes.io/zone" = "{{EC2_AVAILABILITY_ZONE}}"
+"karpenter.sh/provisioner-name" = "bottlerocket-nodepool"
+"karpenter.sh/nodepool" = "bottlerocket-nodepool"
+
+[settings.kubernetes.node-taints]
+
+[settings.host-containers.admin]
+enabled = true
+
+[settings.host-containers.control]
+enabled = true
+
+[settings.kernel.lockdown]
+mode = "integrity"
+
+[settings.kernel.sysctl]
+"net.ipv4.conf.all.route_localnet" = "1"
+"net.ipv4.ip_forward" = "1"
+"net.bridge.bridge-nf-call-iptables" = "1"
+# eBPF optimizations
+"net.core.bpf_jit_enable" = "1"
+"net.core.bpf_jit_harden" = "2"
+"net.core.bpf_jit_kallsyms" = "1"
+
+[settings.network]
+https-proxy = ""
+no-proxy = []
+
+[settings.oci-hooks.log4j-hotpatch]
+enabled = false
+
+[settings.bootstrap-containers.bootstrap-ecs]
+essential = false
+
+
+resource "helm_release" "cilium" {
+  name             = "cilium"
+  repository       = "https://helm.cilium.io/"
+  chart            = "cilium"
+  version          = "1.14.4"
+  namespace        = "kube-system"
+  create_namespace = false
+  
+  values = [
+    yamlencode({
+      # EKS specific configuration
+      eni = {
+        enabled = true
+      }
+      
+      ipam = {
+        mode = "eni"
+      }
+      
+      egressMasqueradeInterfaces = "eth0"
+      tunnel                     = "disabled"
+      
+      # Enable required features
+      endpointRoutes = {
+        enabled = true
+      }
+      
+      # eBPF Configuration - Full eBPF datapath
+      bpf = {
+        # Replace kube-proxy with eBPF
+        masquerade = true
+        # Enable eBPF-based load balancing
+        lbExternalClusterIP = false
+        # Pre-allocate BPF maps
+        preallocateMaps = true
+        # Enable BPF tproxy for transparent proxying
+        tproxy = true
+        # Host routing via eBPF
+        hostRouting = true
+        # Enable auto direct node routes
+        autoDirectNodeRoutes = true
+      }
+      
+      # Disable kube-proxy (eBPF replaces it)
+      kubeProxyReplacement = "strict"
+      
+      # eBPF host networking
+      hostServices = {
+        enabled = true
+        protocols = ["tcp", "udp"]
+      }
+      
+      # eBPF NodePort services
+      nodePort = {
+        enabled = true
+        # Enable direct server return for better performance
+        mode = "dsr"
+        # Bind protection prevents other processes from binding to NodePort ranges
+        bindProtection = true
+        # Enable auto protection of NodePort range
+        autoProtectPortRange = true
+      }
+      
+      # eBPF External IPs
+      externalIPs = {
+        enabled = true
+      }
+      
+      # eBPF Host Port services
+      hostPort = {
+        enabled = true
+      }
+      
+      # Session affinity via eBPF
+      sessionAffinity = true
+      
+      # Cluster configuration
+      cluster = {
+        name = var.cluster_name
+        id   = "1"
+      }
+      
+      # Enable Hubble for observability
+      hubble = {
+        enabled = true
+        metrics = {
+          enabled = [
+            "dns",
+            "drop",
+            "tcp",
+            "flow",
+            "port-distribution",
+            "icmp",
+            "http",
+            "flows-to-world",
+            "kafka",
+            "httpV2"
+          ]
+          # Enable eBPF-specific metrics
+          enableOpenMetrics = true
+        }
+        relay = {
+          enabled = true
+          # Enable Prometheus metrics for Hubble relay
+          prometheus = {
+            enabled = true
+            port = 9966
+          }
+        }
+        ui = {
+          enabled = true
+          # Frontend configuration
+          frontend = {
+            resources = {
+              limits = {
+                cpu = "1000m"
+                memory = "1024M"
+              }
+              requests = {
+                cpu = "100m"
+                memory = "64Mi"
+              }
+            }
+          }
+          # Backend configuration  
+          backend = {
+            resources = {
+              limits = {
+                cpu = "1000m"
+                memory = "1024M"
+              }
+              requests = {
+                cpu = "100m"
+                memory = "64Mi"
+              }
+            }
+          }
+        }
+        # Enable eBPF datapath visibility
+        skipUnknownCGroupIDs = false
+        # Monitor all network namespaces
+        listenAddress = ":4244"
+      }
+      
+      # Operator configuration
+      operator = {
+        replicas = 2
+        rollOutPods = true
+        # Enable Prometheus metrics for operator
+        prometheus = {
+          enabled = true
+          port = 9963
+        }
+      }
+      
+      # Enable policy enforcement
+      policyEnforcementMode = "default"
+      
+      # Resource requirements
+      resources = {
+        limits = {
+          cpu    = "4000m"
+          memory = "4Gi"
+        }
+        requests = {
+          cpu    = "100m"
+          memory = "512Mi"
+        }
+      }
+      
+      # Security context
+      securityContext = {
+        privileged = true
+        # Required for eBPF programs
+        capabilities = {
+          ciliumAgent = [
+            "CHOWN",
+            "KILL",
+            "NET_ADMIN",
+            "NET_RAW",
+            "IPC_LOCK",
+            "SYS_ADMIN",
+            "SYS_RESOURCE",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "SETGID",
+            "SETUID"
+          ]
+          cleanCiliumState = [
+            "NET_ADMIN",
+            "SYS_ADMIN",
+            "SYS_RESOURCE"
+          ]
+        }
+      }
+      
+      # Service monitor for Prometheus
+      serviceMonitor = {
+        enabled = true
+        # Monitor Cilium agent metrics
+        labels = {
+          app = "cilium-agent"
+        }
+        # Monitor Cilium operator metrics  
+        operator = {
+          enabled = true
+          labels = {
+            app = "cilium-operator"
+          }
+        }
+        # Monitor Hubble metrics
+        hubble = {
+          enabled = true
+          labels = {
+            app = "hubble"
+          }
+        }
+      }
+      
+      # Enable bandwidth manager with eBPF
+      bandwidthManager = {
+        enabled = true
+        bbr     = true
+      }
+      
+      # eBPF Load balancer configuration
+      loadBalancer = {
+        algorithm = "maglev"
+        # Use eBPF for load balancing
+        mode = "dsr"
+        # Enable connection tracking via eBPF
+        acceleration = "native"
+        # Service topology aware hints
+        serviceTopology = true
+      }
+      
+      # Enable local redirect policy via eBPF
+      localRedirectPolicy = true
+      
+      # eBPF-based network policy enforcement
+      policyAuditMode = false
+      
+      # Enable WireGuard transparent encryption (optional)
+      encryption = {
+        enabled = false
+        type = "wireguard"
+        # Enable only if you need pod-to-pod encryption
+        nodeEncryption = false
+      }
+      
+      # Advanced eBPF features
+      enableRuntimeDeviceDetection = true
+      enableXTSocketFallback = true
+      installIptablesRules = false  # eBPF replaces iptables
+      enableIPv4Masquerade = true
+      enableIPv6Masquerade = false
+      
+      # Socket load balancing via eBPF
+      sockops = {
+        enabled = true
+      }
+      
+      # eBPF device detection
+      devices = ["eth0", "ens+"]
+      
+      # Kubernetes version compatibility
+      k8sServiceHost = var.cluster_endpoint
+      k8sServicePort = "443"
+      
+      # Additional eBPF optimizations
+      bpfMapDynamicSizeRatio = 0.0025
+      preallocateBPFMaps = true
+      
+      # Enable L7 proxy (requires more resources but enables L7 policies)
+      l7Proxy = true
+      
+      # Prometheus integration
+      prometheus = {
+        enabled = true
+        port = 9962
+        serviceMonitor = {
+          enabled = true
+          labels = {
+            prometheus = "kube-prometheus"
+          }
+        }
+      }
+      
+      # Debug configuration (disable in production)
+      debug = {
+        enabled = false
+        verbose = []
+      }
+    })
+  ]
+  
+  timeout = 600
+  
+  depends_on = [kubernetes_daemonset.remove_vpc_cni]
+}
