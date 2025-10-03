@@ -1,78 +1,754 @@
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: nexus-repository-policy
-  namespace: nexusrepo
-spec:
-  podSelector:
-    matchLabels:
-      app: nexus-repository-manager
-  policyTypes:
-    - Ingress
-    - Egress
+import * as cdk from 'aws-cdk-lib';
+import * as eks from 'aws-cdk-lib/aws-eks';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import { Construct } from 'constructs';
+
+export interface NexusDeploymentProps extends cdk.StackProps {
+  /**
+   * Existing EKS cluster to deploy to (optional)
+   */
+  cluster?: eks.ICluster;
   
-  ingress:
-    # Allow traffic from ingress controller
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              name: ingress-nginx
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: ingress-nginx
-      ports:
-        - protocol: TCP
-          port: 8081  # Nexus web UI and API port
-    
-    # Allow traffic from application namespaces that need to pull artifacts
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              access-nexus: "true"
-      ports:
-        - protocol: TCP
-          port: 8081
-    
-    # Allow traffic from within the same namespace (for health checks, etc.)
-    - from:
-        - podSelector: {}
-      ports:
-        - protocol: TCP
-          port: 8081
+  /**
+   * Namespace for Nexus deployment
+   */
+  namespace?: string;
   
-  egress:
-    # Allow DNS resolution
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              name: kube-system
-        - podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - protocol: UDP
-          port: 53
+  /**
+   * Enable Helm chart deployment
+   */
+  useHelm?: boolean;
+}
+
+export class NexusDeploymentStack extends cdk.Stack {
+  public readonly cluster: eks.ICluster;
+  
+  constructor(scope: Construct, id: string, props?: NexusDeploymentProps) {
+    super(scope, id, props);
     
-    # Allow HTTPS for proxy repositories and external registries
-    - to:
-        - namespaceSelector: {}
-      ports:
-        - protocol: TCP
-          port: 443
+    const namespace = props?.namespace || 'nexusrepo';
     
-    # Allow HTTP for proxy repositories
-    - to:
-        - namespaceSelector: {}
-      ports:
-        - protocol: TCP
-          port: 80
+    // Use existing cluster or create a new one
+    this.cluster = props?.cluster || this.createEksCluster();
     
-    # Allow communication within the namespace (if using PostgreSQL, etc.)
-    - to:
-        - podSelector: {}
-      ports:
-        - protocol: TCP
-          port: 5432  # PostgreSQL
-        - protocol: TCP
-          port: 8081  # Internal Nexus communication
+    // Create namespace
+    this.createNamespace(namespace);
+    
+    // Deploy Nexus
+    if (props?.useHelm) {
+      this.deployNexusWithHelm(namespace);
+    }
+    
+    // Deploy network policy
+    this.deployNetworkPolicy(namespace);
+    
+    // Deploy RBAC resources
+    this.deployRBAC(namespace);
+    
+    // Deploy security contexts and hardening
+    this.deployHardenedNexus(namespace);
+  }
+  
+  /**
+   * Create namespace with security labels
+   */
+  private createNamespace(namespace: string): void {
+    this.cluster.addManifest('nexus-namespace', {
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: {
+        name: namespace,
+        labels: {
+          name: namespace,
+          'pod-security.kubernetes.io/enforce': 'restricted',
+          'pod-security.kubernetes.io/audit': 'restricted',
+          'pod-security.kubernetes.io/warn': 'restricted',
+        },
+      },
+    });
+  }
+  
+  /**
+   * Deploy Network Policy
+   */
+  private deployNetworkPolicy(namespace: string): void {
+    this.cluster.addManifest('nexus-network-policy', {
+      apiVersion: 'networking.k8s.io/v1',
+      kind: 'NetworkPolicy',
+      metadata: {
+        name: 'nexus-repository-policy',
+        namespace: namespace,
+      },
+      spec: {
+        podSelector: {
+          matchLabels: {
+            app: 'nexus-repository-manager',
+          },
+        },
+        policyTypes: ['Ingress', 'Egress'],
+        ingress: [
+          {
+            // Allow traffic from ingress controller
+            from: [
+              {
+                namespaceSelector: {
+                  matchLabels: {
+                    name: 'ingress-nginx',
+                  },
+                },
+              },
+              {
+                podSelector: {
+                  matchLabels: {
+                    'app.kubernetes.io/name': 'ingress-nginx',
+                  },
+                },
+              },
+            ],
+            ports: [
+              {
+                protocol: 'TCP',
+                port: 8081,
+              },
+            ],
+          },
+          {
+            // Allow traffic from application namespaces
+            from: [
+              {
+                namespaceSelector: {
+                  matchLabels: {
+                    'access-nexus': 'true',
+                  },
+                },
+              },
+            ],
+            ports: [
+              {
+                protocol: 'TCP',
+                port: 8081,
+              },
+            ],
+          },
+          {
+            // Allow traffic within namespace
+            from: [
+              {
+                podSelector: {},
+              },
+            ],
+            ports: [
+              {
+                protocol: 'TCP',
+                port: 8081,
+              },
+            ],
+          },
+        ],
+        egress: [
+          {
+            // Allow DNS resolution
+            to: [
+              {
+                namespaceSelector: {
+                  matchLabels: {
+                    name: 'kube-system',
+                  },
+                },
+              },
+              {
+                podSelector: {
+                  matchLabels: {
+                    'k8s-app': 'kube-dns',
+                  },
+                },
+              },
+            ],
+            ports: [
+              {
+                protocol: 'UDP',
+                port: 53,
+              },
+            ],
+          },
+          {
+            // Allow HTTPS for proxy repositories
+            to: [
+              {
+                namespaceSelector: {},
+              },
+            ],
+            ports: [
+              {
+                protocol: 'TCP',
+                port: 443,
+              },
+            ],
+          },
+          {
+            // Allow HTTP for proxy repositories
+            to: [
+              {
+                namespaceSelector: {},
+              },
+            ],
+            ports: [
+              {
+                protocol: 'TCP',
+                port: 80,
+              },
+            ],
+          },
+          {
+            // Allow communication within namespace
+            to: [
+              {
+                podSelector: {},
+              },
+            ],
+            ports: [
+              {
+                protocol: 'TCP',
+                port: 5432, // PostgreSQL
+              },
+              {
+                protocol: 'TCP',
+                port: 8081, // Internal Nexus
+              },
+            ],
+          },
+        ],
+      },
+    });
+  }
+  
+  /**
+   * Deploy RBAC resources
+   */
+  private deployRBAC(namespace: string): void {
+    // Service Account
+    const serviceAccount = this.cluster.addManifest('nexus-service-account', {
+      apiVersion: 'v1',
+      kind: 'ServiceAccount',
+      metadata: {
+        name: 'nexus-sa',
+        namespace: namespace,
+      },
+      automountServiceAccountToken: false,
+    });
+    
+    // Role
+    const role = this.cluster.addManifest('nexus-role', {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'Role',
+      metadata: {
+        name: 'nexus-role',
+        namespace: namespace,
+      },
+      rules: [
+        {
+          apiGroups: [''],
+          resources: ['configmaps'],
+          verbs: ['get', 'list'],
+        },
+        {
+          apiGroups: [''],
+          resources: ['secrets'],
+          verbs: ['get'],
+          resourceNames: ['nexus-credentials'],
+        },
+      ],
+    });
+    
+    // Role Binding
+    const roleBinding = this.cluster.addManifest('nexus-rolebinding', {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'RoleBinding',
+      metadata: {
+        name: 'nexus-rolebinding',
+        namespace: namespace,
+      },
+      subjects: [
+        {
+          kind: 'ServiceAccount',
+          name: 'nexus-sa',
+          namespace: namespace,
+        },
+      ],
+      roleRef: {
+        kind: 'Role',
+        name: 'nexus-role',
+        apiGroup: 'rbac.authorization.k8s.io',
+      },
+    });
+    
+    // Set dependencies
+    role.node.addDependency(serviceAccount);
+    roleBinding.node.addDependency(role);
+  }
+  
+  /**
+   * Deploy hardened Nexus StatefulSet
+   */
+  private deployHardenedNexus(namespace: string): void {
+    // ConfigMap for Nexus properties
+    this.cluster.addManifest('nexus-configmap', {
+      apiVersion: 'v1',
+      kind: 'ConfigMap',
+      metadata: {
+        name: 'nexus-properties',
+        namespace: namespace,
+      },
+      data: {
+        'nexus.properties': [
+          'nexus.scripts.allowCreation=false',
+          'nexus.security.randompassword=true',
+        ].join('\n'),
+      },
+    });
+    
+    // PersistentVolumeClaim
+    this.cluster.addManifest('nexus-pvc', {
+      apiVersion: 'v1',
+      kind: 'PersistentVolumeClaim',
+      metadata: {
+        name: 'nexus-data',
+        namespace: namespace,
+      },
+      spec: {
+        accessModes: ['ReadWriteOnce'],
+        storageClassName: 'gp3',
+        resources: {
+          requests: {
+            storage: '100Gi',
+          },
+        },
+      },
+    });
+    
+    // StatefulSet with hardened security
+    this.cluster.addManifest('nexus-statefulset', {
+      apiVersion: 'apps/v1',
+      kind: 'StatefulSet',
+      metadata: {
+        name: 'nexus',
+        namespace: namespace,
+        labels: {
+          app: 'nexus-repository-manager',
+        },
+      },
+      spec: {
+        serviceName: 'nexus',
+        replicas: 3,
+        selector: {
+          matchLabels: {
+            app: 'nexus-repository-manager',
+          },
+        },
+        template: {
+          metadata: {
+            labels: {
+              app: 'nexus-repository-manager',
+              version: 'v1',
+            },
+            annotations: {
+              'container.apparmor.security.beta.kubernetes.io/nexus': 'runtime/default',
+            },
+          },
+          spec: {
+            serviceAccountName: 'nexus-sa',
+            securityContext: {
+              runAsNonRoot: true,
+              runAsUser: 200,
+              runAsGroup: 200,
+              fsGroup: 200,
+              seccompProfile: {
+                type: 'RuntimeDefault',
+              },
+            },
+            tolerations: [
+              {
+                key: 'nexus',
+                operator: 'Equal',
+                value: 'true',
+                effect: 'NoSchedule',
+              },
+            ],
+            nodeSelector: {
+              workload: 'nexus',
+            },
+            affinity: {
+              podAntiAffinity: {
+                requiredDuringSchedulingIgnoredDuringExecution: [
+                  {
+                    labelSelector: {
+                      matchExpressions: [
+                        {
+                          key: 'app',
+                          operator: 'In',
+                          values: ['nexus-repository-manager'],
+                        },
+                      ],
+                    },
+                    topologyKey: 'kubernetes.io/hostname',
+                  },
+                ],
+              },
+            },
+            containers: [
+              {
+                name: 'nexus',
+                image: 'sonatype/nexus3:3.70.0',
+                imagePullPolicy: 'Always',
+                securityContext: {
+                  allowPrivilegeEscalation: false,
+                  readOnlyRootFilesystem: false,
+                  runAsNonRoot: true,
+                  runAsUser: 200,
+                  capabilities: {
+                    drop: ['ALL'],
+                  },
+                  seccompProfile: {
+                    type: 'RuntimeDefault',
+                  },
+                },
+                ports: [
+                  {
+                    name: 'http',
+                    containerPort: 8081,
+                    protocol: 'TCP',
+                  },
+                ],
+                env: [
+                  {
+                    name: 'INSTALL4J_ADD_VM_PARAMS',
+                    value: '-Xms2703m -Xmx2703m -XX:MaxDirectMemorySize=2703m -Djava.util.prefs.userRoot=/nexus-data/javaprefs',
+                  },
+                ],
+                resources: {
+                  requests: {
+                    memory: '4Gi',
+                    cpu: '2000m',
+                    'ephemeral-storage': '2Gi',
+                  },
+                  limits: {
+                    memory: '8Gi',
+                    cpu: '4000m',
+                    'ephemeral-storage': '4Gi',
+                  },
+                },
+                volumeMounts: [
+                  {
+                    name: 'nexus-data',
+                    mountPath: '/nexus-data',
+                  },
+                  {
+                    name: 'nexus-properties',
+                    mountPath: '/nexus-data/etc/nexus.properties',
+                    subPath: 'nexus.properties',
+                  },
+                  {
+                    name: 'tmp',
+                    mountPath: '/tmp',
+                  },
+                ],
+                livenessProbe: {
+                  httpGet: {
+                    path: '/service/rest/v1/status',
+                    port: 8081,
+                    scheme: 'HTTP',
+                  },
+                  initialDelaySeconds: 180,
+                  periodSeconds: 30,
+                  timeoutSeconds: 5,
+                  failureThreshold: 3,
+                },
+                readinessProbe: {
+                  httpGet: {
+                    path: '/service/rest/v1/status',
+                    port: 8081,
+                    scheme: 'HTTP',
+                  },
+                  initialDelaySeconds: 60,
+                  periodSeconds: 10,
+                  timeoutSeconds: 5,
+                  failureThreshold: 3,
+                },
+                startupProbe: {
+                  httpGet: {
+                    path: '/service/rest/v1/status',
+                    port: 8081,
+                    scheme: 'HTTP',
+                  },
+                  initialDelaySeconds: 30,
+                  periodSeconds: 10,
+                  timeoutSeconds: 5,
+                  failureThreshold: 30,
+                },
+              },
+            ],
+            volumes: [
+              {
+                name: 'nexus-data',
+                persistentVolumeClaim: {
+                  claimName: 'nexus-data',
+                },
+              },
+              {
+                name: 'nexus-properties',
+                configMap: {
+                  name: 'nexus-properties',
+                },
+              },
+              {
+                name: 'tmp',
+                emptyDir: {},
+              },
+            ],
+          },
+        },
+      },
+    });
+    
+    // Service
+    this.cluster.addManifest('nexus-service', {
+      apiVersion: 'v1',
+      kind: 'Service',
+      metadata: {
+        name: 'nexus',
+        namespace: namespace,
+        labels: {
+          app: 'nexus-repository-manager',
+        },
+      },
+      spec: {
+        type: 'ClusterIP',
+        ports: [
+          {
+            name: 'http',
+            port: 8081,
+            targetPort: 8081,
+            protocol: 'TCP',
+          },
+        ],
+        selector: {
+          app: 'nexus-repository-manager',
+        },
+      },
+    });
+    
+    // Ingress
+    this.cluster.addManifest('nexus-ingress', {
+      apiVersion: 'networking.k8s.io/v1',
+      kind: 'Ingress',
+      metadata: {
+        name: 'nexus',
+        namespace: namespace,
+        annotations: {
+          'cert-manager.io/cluster-issuer': 'letsencrypt-prod',
+          'nginx.ingress.kubernetes.io/ssl-redirect': 'true',
+          'nginx.ingress.kubernetes.io/force-ssl-redirect': 'true',
+          'nginx.ingress.kubernetes.io/proxy-body-size': '500m',
+          'nginx.ingress.kubernetes.io/proxy-connect-timeout': '60',
+          'nginx.ingress.kubernetes.io/proxy-send-timeout': '60',
+          'nginx.ingress.kubernetes.io/proxy-read-timeout': '60',
+          'nginx.ingress.kubernetes.io/rate-limit': '100',
+          'nginx.ingress.kubernetes.io/limit-rps': '10',
+        },
+      },
+      spec: {
+        ingressClassName: 'nginx',
+        tls: [
+          {
+            hosts: ['nexus.example.com'],
+            secretName: 'nexus-tls',
+          },
+        ],
+        rules: [
+          {
+            host: 'nexus.example.com',
+            http: {
+              paths: [
+                {
+                  path: '/',
+                  pathType: 'Prefix',
+                  backend: {
+                    service: {
+                      name: 'nexus',
+                      port: {
+                        number: 8081,
+                      },
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    
+    // Resource Quota
+    this.cluster.addManifest('nexus-resource-quota', {
+      apiVersion: 'v1',
+      kind: 'ResourceQuota',
+      metadata: {
+        name: 'nexus-quota',
+        namespace: namespace,
+      },
+      spec: {
+        hard: {
+          'requests.cpu': '8',
+          'requests.memory': '16Gi',
+          persistentvolumeclaims: '10',
+        },
+      },
+    });
+    
+    // Limit Range
+    this.cluster.addManifest('nexus-limit-range', {
+      apiVersion: 'v1',
+      kind: 'LimitRange',
+      metadata: {
+        name: 'nexus-limits',
+        namespace: namespace,
+      },
+      spec: {
+        limits: [
+          {
+            max: {
+              cpu: '4',
+              memory: '8Gi',
+            },
+            min: {
+              cpu: '100m',
+              memory: '512Mi',
+            },
+            type: 'Container',
+          },
+        ],
+      },
+    });
+  }
+  
+  /**
+   * Deploy Nexus using Helm chart
+   */
+  private deployNexusWithHelm(namespace: string): void {
+    this.cluster.addHelmChart('nexus-ha', {
+      chart: 'nxrm-ha',
+      repository: 'https://sonatype.github.io/helm3-charts/',
+      namespace: namespace,
+      release: 'nxrm-ha',
+      version: '75.0.0',
+      values: {
+        statefulset: {
+          replicaCount: 3,
+          tolerations: [
+            {
+              key: 'nexus',
+              operator: 'Equal',
+              value: 'true',
+              effect: 'NoSchedule',
+            },
+          ],
+          securityContext: {
+            runAsNonRoot: true,
+            runAsUser: 200,
+            runAsGroup: 200,
+            fsGroup: 200,
+            seccompProfile: {
+              type: 'RuntimeDefault',
+            },
+          },
+          containerSecurityContext: {
+            allowPrivilegeEscalation: false,
+            readOnlyRootFilesystem: false,
+            runAsNonRoot: true,
+            runAsUser: 200,
+            capabilities: {
+              drop: ['ALL'],
+            },
+          },
+          resources: {
+            requests: {
+              memory: '4Gi',
+              cpu: '2000m',
+            },
+            limits: {
+              memory: '8Gi',
+              cpu: '4000m',
+            },
+          },
+        },
+      },
+      wait: true,
+      timeout: cdk.Duration.minutes(15),
+    });
+  }
+  
+  /**
+   * Create EKS cluster
+   */
+  private createEksCluster(): eks.Cluster {
+    const vpc = new ec2.Vpc(this, 'NexusVpc', {
+      maxAzs: 3,
+      natGateways: 1,
+    });
+    
+    const cluster = new eks.Cluster(this, 'NexusCluster', {
+      version: eks.KubernetesVersion.V1_30,
+      vpc,
+      defaultCapacity: 0,
+      clusterName: 'nexus-cluster',
+    });
+    
+    cluster.addNodegroupCapacity('nexus-nodes', {
+      instanceTypes: [new ec2.InstanceType('t3.xlarge')],
+      minSize: 3,
+      maxSize: 6,
+      desiredSize: 3,
+      diskSize: 100,
+      labels: {
+        workload: 'nexus',
+      },
+    });
+    
+    return cluster;
+  }
+  
+  /**
+   * Output cluster information
+   */
+  public addOutputs(): void {
+    new cdk.CfnOutput(this, 'ClusterName', {
+      value: this.cluster.clusterName,
+      description: 'EKS Cluster Name',
+    });
+    
+    new cdk.CfnOutput(this, 'TaintNodesCommand', {
+      value: 'kubectl taint nodes -l workload=nexus nexus=true:NoSchedule',
+      description: 'Command to taint nodes for Nexus',
+    });
+    
+    new cdk.CfnOutput(this, 'ConfigureKubectl', {
+      value: `aws eks update-kubeconfig --name ${this.cluster.clusterName} --region ${this.region}`,
+      description: 'Configure kubectl',
+    });
+  }
+}
+
+// App
+const app = new cdk.App();
+
+new NexusDeploymentStack(app, 'NexusDeploymentStack', {
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION || 'us-east-1',
+  },
+  namespace: 'nexusrepo',
+  useHelm: false, // Set to true to use Helm instead
+}).addOutputs();
+
+app.synth();
