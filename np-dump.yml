@@ -1,3 +1,17 @@
+PACKAGE_NAME="${{ github.event.repository.name }}"
+          ORG_NAME="${{ github.repository_owner }}"
+          
+          # URL encode the package name (replace / with %2F, @ with %40)
+          ENCODED_PACKAGE=$(echo "@${ORG_NAME}/${PACKAGE_NAME}" | sed 's/@/%40/g' | sed 's/\//%2F/g')
+          
+          curl -X PATCH \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://your-github-enterprise.com/api/v3/orgs/${ORG_NAME}/packages/npm/${ENCODED_PACKAGE}" \
+            -d '{"visibility":"internal"}' \
+            --fail-with-body || echo "Failed to set v
+
+
 import * as cdk from 'aws-cdk-lib';
 import * as eks from 'aws-cdk-lib/aws-eks';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
